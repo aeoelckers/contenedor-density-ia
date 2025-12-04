@@ -1,5 +1,5 @@
-import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 import gradio as gr
 
 from inference_sdk import InferenceHTTPClient
@@ -9,96 +9,70 @@ from config import (
     ROBOFLOW_WORKFLOW_ID,
 )
 
-# Crear cliente Roboflow
+# Cliente Roboflow
 client = InferenceHTTPClient(
     api_url="https://serverless.roboflow.com",
     api_key=ROBOFLOW_API_KEY
 )
 
-def detectar_contenedores(img):
+def detectar_contenedores(img_pil):
     """
-    Recibe una imagen PIL, la convierte a BGR, la envía a Roboflow
-    y devuelve las detecciones + conteo.
+    Recibe imagen PIL desde Gradio, llama a Roboflow Workflow,
+    dibuja las cajas usando PIL (sin OpenCV) y retorna conteo + imagen.
     """
 
-    # PIL → numpy RGB
-    img_np = np.array(img)
+    # Convertir la imagen PIL a JPG binario para Roboflow
+    img_bytes = img_pil.convert("RGB")
+    img_buffer = np.asarray(img_bytes)
 
-    # Guardar temporalmente como JPG en memoria (Roboflow necesita archivo)
-    # Pero NO guardamos en disco, hacemos encode en RAM:
-    ok, buffer = cv2.imencode(".jpg", cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
-    if not ok:
-        raise Exception("Error al convertir imagen a JPG")
+    # Roboflow requiere imagen como bytes, así que la convertimos:
+    import io
+    buff = io.BytesIO()
+    img_pil.save(buff, format="JPEG")
+    buff.seek(0)
 
-    # Ejecutar Workflow en Roboflow
+    # Hacer la llamada al workflow
     result = client.run_workflow(
         workspace_name=ROBOFLOW_WORKSPACE,
         workflow_id=ROBOFLOW_WORKFLOW_ID,
-        images={
-            "image": buffer.tobytes()
-        },
+        images={"image": buff.getvalue()},
         use_cache=True
     )
 
-    # --- Interpretar predicciones ---
-    predictions = result["predictions"]
-    img_out = img_np.copy()
+    predictions = result.get("predictions", [])
+    conteo = len(predictions)
 
-    conteo = 0
+    # Dibujamos sobre una copia
+    draw = ImageDraw.Draw(img_pil)
 
     for p in predictions:
         x, y = p["x"], p["y"]
         w, h = p["width"], p["height"]
         conf = p.get("confidence", 0)
 
-        # Convertir centro → esquinas
-        x1, y1 = int(x - w/2), int(y - h/2)
-        x2, y2 = int(x + w/2), int(y + h/2)
+        # Convertir centro a esquinas
+        x1 = int(x - w/2)
+        y1 = int(y - h/2)
+        x2 = int(x + w/2)
+        y2 = int(y + h/2)
 
-        conteo += 1
+        draw.rectangle([x1, y1, x2, y2], outline="lime", width=3)
+        draw.text((x1, y1 - 10), f"{conf:.2f}", fill="lime")
 
-        # Dibujar bounding box
-        cv2.rectangle(
-            img_out,
-            (x1, y1),
-            (x2, y2),
-            (0, 255, 0),
-            2
-        )
+    return img_pil, f"Contenedores detectados: {conteo}"
 
-        cv2.putText(
-            img_out,
-            f"{conf:.2f}",
-            (x1, y1 - 5),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2
-        )
-
-    return img_out, f"Contenedores detectados: {conteo}"
-
-# ----- Interfaz Gradio -----
+# Interfaz de Gradio
 
 with gr.Blocks() as demo:
     gr.Markdown("# Contador de Contenedores (Roboflow)")
-    gr.Markdown(
-        "Sube una imagen satelital / Google Earth con contenedores. "
-        "El modelo de Roboflow detectará cada contenedor (rectángulo)."
-    )
+    gr.Markdown("Sube una imagen satelital o Google Earth. La IA detectará contenedores.")
 
-    with gr.Row():
-        entrada = gr.Image(type="pil", label="Imagen de entrada")
-        salida = gr.Image(type="numpy", label="Detecciones")
+    input_img = gr.Image(type="pil", label="Imagen")
+    output_img = gr.Image(type="pil", label="Detecciones")
+    output_text = gr.Textbox(label="Resultado")
 
-    texto = gr.Textbox(label="Resultado")
-
-    boton = gr.Button("Contar contenedores")
-    boton.click(
-        detectar_contenedores,
-        inputs=entrada,
-        outputs=[salida, texto]
-    )
+    btn = gr.Button("Contar contenedores")
+    btn.click(detectar_contenedores, inputs=input_img, outputs=[output_img, output_text])
 
 if __name__ == "__main__":
     demo.launch()
