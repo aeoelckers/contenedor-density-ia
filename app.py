@@ -1,75 +1,104 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO
 import gradio as gr
 
-# 1) Cargar modelo YOLO
-# Para pruebas: usa un modelo general. Cuando tengas tu modelo propio,
-# cambia "yolov8n.pt" por "models/contenedores.pt"
-model = YOLO("yolov8n.pt")
+from inference_sdk import InferenceHTTPClient
+from config import (
+    ROBOFLOW_API_KEY,
+    ROBOFLOW_WORKSPACE,
+    ROBOFLOW_WORKFLOW_ID,
+)
 
-# Nombre de la clase que usaremos como "contenedor".
-# Cuando entrenes tu modelo propio, normalmente será class 0 -> "container"
-CONTAINER_CLASS_NAME = "container"   # ajústalo cuando entrenes tu modelo
+# Crear cliente Roboflow
+client = InferenceHTTPClient(
+    api_url="https://serverless.roboflow.com",
+    api_key=ROBOFLOW_API_KEY
+)
 
-def contar_contenedores(img):
+def detectar_contenedores(img):
     """
-    Recibe una imagen (PIL) desde Gradio, detecta contenedores
-    y devuelve la imagen anotada + cantidad.
+    Recibe una imagen PIL, la convierte a BGR, la envía a Roboflow
+    y devuelve las detecciones + conteo.
     """
-    # Convertir PIL -> numpy (BGR para OpenCV)
-    img = np.array(img)
-    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-    # 2) Correr detección
-    results = model(img_bgr)[0]
+    # PIL → numpy RGB
+    img_np = np.array(img)
+
+    # Guardar temporalmente como JPG en memoria (Roboflow necesita archivo)
+    # Pero NO guardamos en disco, hacemos encode en RAM:
+    ok, buffer = cv2.imencode(".jpg", cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise Exception("Error al convertir imagen a JPG")
+
+    # Ejecutar Workflow en Roboflow
+    result = client.run_workflow(
+        workspace_name=ROBOFLOW_WORKSPACE,
+        workflow_id=ROBOFLOW_WORKFLOW_ID,
+        images={
+            "image": buffer.tobytes()
+        },
+        use_cache=True
+    )
+
+    # --- Interpretar predicciones ---
+    predictions = result["predictions"]
+    img_out = img_np.copy()
 
     conteo = 0
-    for box, cls_id in zip(results.boxes.xyxy, results.boxes.cls):
-        x1, y1, x2, y2 = box.tolist()
-        cls_id = int(cls_id.item())
-        cls_name = model.names.get(cls_id, str(cls_id))
 
-        # Si todavía no tienes modelo entrenado,
-        # puedes dejar esto como conteo total: conteo += 1
-        # y ver qué clases te está detectando.
-        if cls_name == CONTAINER_CLASS_NAME:
-            conteo += 1
-            # Dibujar recuadro verde
-            cv2.rectangle(img_bgr, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            cv2.putText(
-                img_bgr, cls_name,
-                (int(x1), int(y1) - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1
-            )
+    for p in predictions:
+        x, y = p["x"], p["y"]
+        w, h = p["width"], p["height"]
+        conf = p.get("confidence", 0)
 
-    # Volver a RGB para mostrar
-    img_out = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        # Convertir centro → esquinas
+        x1, y1 = int(x - w/2), int(y - h/2)
+        x2, y2 = int(x + w/2), int(y + h/2)
 
-    texto = f"Contenedores detectados: {conteo}"
-    return img_out, texto
+        conteo += 1
 
-# 3) Interfaz con Gradio
+        # Dibujar bounding box
+        cv2.rectangle(
+            img_out,
+            (x1, y1),
+            (x2, y2),
+            (0, 255, 0),
+            2
+        )
+
+        cv2.putText(
+            img_out,
+            f"{conf:.2f}",
+            (x1, y1 - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2
+        )
+
+    return img_out, f"Contenedores detectados: {conteo}"
+
+# ----- Interfaz Gradio -----
+
 with gr.Blocks() as demo:
-    gr.Markdown("# Contador de contenedores en imágenes satelitales")
+    gr.Markdown("# Contador de Contenedores (Roboflow)")
     gr.Markdown(
-        "Sube un pantallazo de Google Earth **recortado justo a la zona roja**. "
-        "El modelo marcará y contará los contenedores detectados."
+        "Sube una imagen satelital / Google Earth con contenedores. "
+        "El modelo de Roboflow detectará cada contenedor (rectángulo)."
     )
 
     with gr.Row():
-        input_img = gr.Image(type="pil", label="Imagen de entrada")
-        output_img = gr.Image(type="numpy", label="Detecciones")
-    output_text = gr.Textbox(label="Resultado", interactive=False)
+        entrada = gr.Image(type="pil", label="Imagen de entrada")
+        salida = gr.Image(type="numpy", label="Detecciones")
 
-    btn = gr.Button("Contar contenedores")
+    texto = gr.Textbox(label="Resultado")
 
-    btn.click(
-        contar_contenedores,
-        inputs=input_img,
-        outputs=[output_img, output_text],
+    boton = gr.Button("Contar contenedores")
+    boton.click(
+        detectar_contenedores,
+        inputs=entrada,
+        outputs=[salida, texto]
     )
 
-# 4) Lanzar app
 if __name__ == "__main__":
     demo.launch()
